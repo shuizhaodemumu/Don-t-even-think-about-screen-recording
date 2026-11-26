@@ -1,0 +1,369 @@
+#!/usr/bin/python3
+"""Launch a dedicated Fedora X11 display whose screen readback returns black."""
+import argparse
+import contextlib
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import select
+import shlex
+import shutil
+import signal
+import stat
+import struct
+import subprocess as sp
+import sys
+import tempfile
+import time
+
+PREFIX = Path(__file__).resolve().parent.parent
+SERVERS = PREFIX / "libexec" / "x11-showcase"
+DEMO = PREFIX / "share" / "x11-showcase" / "demo.mp4"
+
+
+class Error(Exception):
+    pass
+
+
+class Interrupted(Exception):
+    pass
+
+
+def stop(signum, frame):
+    raise Interrupted(signum)
+
+
+def private_dir(path):
+    meta = path.lstat()
+    if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.getuid()
+            or stat.S_IMODE(meta.st_mode) != 0o700):
+        raise Error(f"目录必须由当前用户拥有，权限为 0700：{path}")
+
+
+def state_dir():
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    if not runtime.is_absolute():
+        raise Error("XDG_RUNTIME_DIR 必须是绝对路径")
+    private_dir(runtime)
+    path = runtime / "x11-showcase"
+    path.mkdir(mode=0o700, exist_ok=True)
+    private_dir(path)
+    return path
+
+
+def singleton(path):
+    return os.fdopen(os.open(path / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), "rb+")
+
+
+def process_start(pid):
+    # Field 22 (starttime) comes after a possible space or ')' in field 2 (comm).
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+
+
+def load_display(path):
+    with singleton(path) as fd:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise Error("没有运行中的专用 X11 会话，请先运行 x11-showcase demo")
+    try:
+        s = json.loads((path / "active.json").read_text())
+        server = SERVERS / ("Xorg" if s["native"] else "Xephyr")
+        auth = Path(s["auth"])
+        if (not re.fullmatch(r":[0-9]+", s["display"]) or not auth.is_file()
+                or auth.parent.parent != path or auth.name != "client.auth"
+                or process_start(s["pid"]) != s["start"]
+                or not Path(f'/proc/{s["pid"]}/exe').samefile(server)):
+            raise ValueError("会话已结束")
+    except (OSError, KeyError, ValueError, IndexError) as e:
+        raise Error("展示服务尚未就绪或已结束。请等待启动器显示 DISPLAY 后重试") from e
+    return s
+
+
+def authority(path, cookie, number=""):
+    def field(data):
+        return struct.pack(">H", len(data)) + data
+    # Xauthority FamilyWild; the client file matches only the allocated display number.
+    data = struct.pack(">H", 65535) + b"".join(field(v) for v in (
+        b"", number.encode("ascii"), b"MIT-MAGIC-COOKIE-1", cookie))
+    with os.fdopen(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as f:
+        f.write(data)
+
+
+def client_env(display, auth):
+    env = os.environ.copy()
+    for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "SESSION_MANAGER",
+                "DBUS_SESSION_BUS_ADDRESS", "AT_SPI_BUS_ADDRESS", "DESKTOP_STARTUP_ID",
+                "XDG_ACTIVATION_TOKEN"):
+        env.pop(key, None)
+    # libwayland can auto-discover wayland-0 when WAYLAND_DISPLAY is absent.
+    # An explicit, nonexistent socket discourages fallback to the host compositor.
+    env.update(DISPLAY=display, XAUTHORITY=str(auth), XDG_SESSION_TYPE="x11",
+               WAYLAND_DISPLAY=str(Path(auth).parent / "no-wayland"),
+               GDK_BACKEND="x11", QT_QPA_PLATFORM="xcb", SDL_VIDEODRIVER="x11",
+               GSK_RENDERER="cairo", SDL_RENDER_DRIVER="software", SDL_FRAMEBUFFER_ACCELERATION="0",
+               LIBGL_ALWAYS_SOFTWARE="1",
+               QT_XCB_GL_INTEGRATION="none", MOZ_ENABLE_WAYLAND="0")
+    return env
+
+
+def native_vt():
+    if os.geteuid() == 0 or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        raise Error("原生 Xorg 模式须从当前用户的本机文字 VT 启动，请勿在桌面终端或 sudo 中运行")
+    if not os.isatty(0):
+        raise Error("原生模式需要前台本机文字 VT")
+    match = re.fullmatch(r"/dev/tty([1-9][0-9]?)", os.ttyname(0))
+    if (not match or Path("/sys/class/tty/tty0/active").read_text().strip() != "tty" + match[1]
+            or os.tcgetpgrp(0) != os.getpgrp()):
+        raise Error("当前不是活动的本机文字 VT")
+    # Xorg asks logind for the session of its *own PID*. Checking "self"
+    # here verifies the same inherited login scope; an environment-provided
+    # XDG_SESSION_ID alone does not establish ownership of the physical seat.
+    query = sp.run(["loginctl", "show-session", "self", "--no-pager", "-p", "User",
+                    "-p", "Seat", "-p", "VTNr", "-p", "Active", "-p", "Remote"],
+                   capture_output=True, text=True, timeout=5)
+    properties = dict(line.split("=", 1) for line in query.stdout.splitlines() if "=" in line)
+    required = {"User": str(os.getuid()), "Seat": "seat0", "VTNr": match[1],
+                "Active": "yes", "Remote": "no"}
+    if query.returncode or any(properties.get(k) != value for k, value in required.items()):
+        raise Error("需要当前用户在本机 seat0 活动 VT 的 logind 登录会话；请从本机文字终端直接登录运行")
+    if not (PREFIX / "lib64/x11-showcase/modules/input/libinput_drv.so").is_file():
+        raise Error("原生会话需要 Fedora 的键盘鼠标驱动，请先运行 sudo dnf install xorg-x11-drv-libinput")
+    return "vt" + match[1]
+
+
+def terminate(p, group):
+    if not p:
+        return
+    # A session bus or a launched GUI child may still exist after its parent exits.
+    def send(sig):
+        with contextlib.suppress(ProcessLookupError):
+            if group:
+                os.killpg(p.pid, sig)
+            else:
+                p.send_signal(sig)
+    send(signal.SIGTERM)
+    try:
+        p.wait(timeout=3 if group else 15)
+    except sp.TimeoutExpired:
+        if group:
+            send(signal.SIGKILL)
+        else:
+            # Native Xorg owns the VT. Let it return the keyboard and console
+            # to text mode and release seat devices before returning the shell.
+            print("正在等待原生 Xorg 释放显示设备并还原文字终端…", file=sys.stderr)
+        p.wait()
+    if group:
+        send(signal.SIGKILL)
+
+
+def display_number(fd, server):
+    deadline = time.monotonic() + 15
+    reply = b""
+    while time.monotonic() < deadline and server.poll() is None and len(reply) < 20:
+        if select.select([fd], [], [], .15)[0]:
+            chunk = os.read(fd, 16)
+            if not chunk:
+                break
+            reply += chunk
+            if b"\n" in reply:
+                break
+    if not re.fullmatch(rb"[0-9]+\n", reply):
+        raise Error("专用 X 服务未就绪。请核对显示设备、宿主 X11 连接和日志")
+    return reply.strip().decode("ascii")
+
+
+def probe():
+    """Called only on the new display, before starting content. Never capture the host."""
+    import ctypes as c
+    x = c.CDLL("libX11.so.6")
+    ptr, ul, ui, integer = c.c_void_p, c.c_ulong, c.c_uint, c.c_int
+    def func(name, result, *args):
+        fn = getattr(x, name)
+        fn.restype, fn.argtypes = result, args
+        return fn
+    d = func("XOpenDisplay", ptr, c.c_char_p)(None)
+    if not d:
+        raise Error("专用 X 服务连接或认证失败")
+    try:
+        root = func("XDefaultRootWindow", ul, ptr)(d)
+        win = func("XCreateSimpleWindow", ul, ptr, ul, integer, integer, ui, ui, ui, ul, ul)(
+            d, root, 10, 10, 16, 16, 0, 0, 0xffffff)
+        func("XMapRaised", integer, ptr, ul)(d, win)
+        func("XClearWindow", integer, ptr, ul)(d, win)
+        func("XSync", integer, ptr, integer)(d, 0)
+        image = func("XGetImage", ptr, ptr, ul, integer, integer, ui, ui, ul, integer)
+        pixel = func("XGetPixel", ul, ptr, integer, integer)
+        free_image = func("XDestroyImage", integer, ptr)
+        for drawable, offset in [(win, 2), (root, 12)]:
+            frame = image(d, drawable, offset, offset, 1, 1, ul(-1).value, 2)
+            if not frame:
+                raise Error("X11 读取测试失败")
+            try:
+                if pixel(frame, 0, 0) & 0xffffff:
+                    raise Error("X11 服务未在窗口和整屏读取时返回黑色，已停止播放")
+            finally:
+                free_image(frame)
+    finally:
+        func("XCloseDisplay", integer, ptr)(d)
+
+
+def player_command(args):
+    if args.action == "run":
+        command = args.command
+        if command[:1] == ["--"]:
+            command = command[1:]
+        if not command:
+            raise Error("run 后须指定程序，例如 run -- xterm")
+        if not shutil.which(command[0]):
+            raise Error(f"找不到要运行的程序：{command[0]}")
+        return command
+    media = DEMO if args.action == "demo" else Path(args.file).expanduser().resolve()
+    if not media.is_file():
+        raise Error(f"找不到视频文件：{media}")
+    if not shutil.which("ffplay"):
+        raise Error("需要提供 ffplay 的 Fedora 软件包")
+    return ["ffplay", "-hide_banner", "-loglevel", "warning", "-fs", "-loop", "0",
+            "-window_title", "X11 展示", str(media)]
+
+
+def connection_info(state):
+    print(f'DISPLAY={state["display"]} XAUTHORITY={shlex.quote(state["auth"])}', flush=True)
+
+
+def launch(args):
+    command = player_command(args)
+    vt = native_vt() if args.native else None
+    if not args.native and not os.environ.get("DISPLAY"):
+        raise Error("未找到宿主 X11 DISPLAY，请在图形桌面（可用 Xwayland）中运行嵌套演示")
+    server_bin = SERVERS / ("Xorg" if args.native else "Xephyr")
+    if not os.access(server_bin, os.X_OK):
+        raise Error(f"专用显示服务缺失：{server_bin}")
+    base = state_dir()
+    with singleton(base) as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise Error("当前用户已有专用 X11 会话；请先退出，或用 record 连接现有会话") from e
+        (base / "active.json").unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="session-", dir=base) as temp:
+            private = Path(temp)
+            cookie = secrets.token_bytes(16)
+            authority(private / "server.auth", cookie)
+            r, w = os.pipe()
+            server = client = None
+            logfile = base / "server.log"
+            try:
+                cmd = [str(server_bin), "-auth", str(private / "server.auth"), "-displayfd", str(w),
+                       "-nolisten", "tcp", "-noreset", "-extension", "RECORD"]
+                server_env = os.environ.copy()
+                if vt:
+                    # Keep stdin, process group, controlling VT, and logind scope.
+                    # Default rootless Xorg logs under XDG_DATA_HOME/xorg/ and
+                    # the installed binary already knows its private module path.
+                    server_env["XDG_DATA_HOME"] = str(base)
+                    cmd.extend([vt, "-keeptty"])
+                else:
+                    cmd.extend(["-screen", "960x540", "-title", "X11 展示 · 本地观看"])
+                try:
+                    with logfile.open("wb") as output:
+                        server = sp.Popen(cmd, pass_fds=(w,), start_new_session=not bool(vt),
+                                          env=server_env, stdout=output, stderr=sp.STDOUT)
+                finally:
+                    os.close(w)
+                try:
+                    number = display_number(r, server)
+                except Error as e:
+                    raise Error(f"{e}：{logfile}") from e
+                auth = private / "client.auth"
+                authority(auth, cookie, number)
+                env = client_env(":" + number, auth)
+                check = sp.run([sys.executable, __file__, "--check-managed-display"],
+                               env=env, timeout=6)
+                if check.returncode:
+                    raise Error("专用 DISPLAY 保护自检失败，未播放内容")
+                client = sp.Popen(["dbus-run-session", "--", *command], env=env, start_new_session=True)
+                state = {"display": ":" + number, "auth": str(auth), "pid": server.pid,
+                         "start": process_start(server.pid), "native": bool(vt)}
+                state_file = private/"state"
+                state_file.write_text(json.dumps(state))
+                state_file.replace(base/"active.json")
+                connection_info(state)
+                while client.poll() is None:
+                    if server.poll() is not None:
+                        raise Error(f"专用 X11 服务已退出，详见 {logfile}")
+                    time.sleep(.12)
+                return client.returncode
+            finally:
+                os.close(r)
+                (base/"active.json").unlink(missing_ok=True)
+                terminate(client, True)
+                terminate(server, not bool(vt))
+
+
+def record(args, state):
+    if args.seconds is not None and (not math.isfinite(args.seconds) or args.seconds <= 0):
+        raise Error("时长必须为正数")
+    if args.window_id is not None and not 0 < args.window_id <= 0xffffffff:
+        raise Error("无效的 X11 窗口 ID")
+    file = Path(args.output).expanduser().resolve()
+    if file.suffix.lower() != ".mkv":
+        raise Error("录制输出应使用 .mkv 扩展名")
+    if file.exists():
+        raise Error(f"文件已存在，请另选输出文件：{file}")
+    env = client_env(state["display"], state["auth"])
+    cmd = ["ffmpeg", "-n", "-nostdin", "-hide_banner", "-loglevel", "warning", "-f", "x11grab",
+           "-framerate", "25", "-draw_mouse", "0"]
+    if args.window_id is not None:
+        cmd.extend(["-window_id", str(args.window_id)])
+    cmd.extend(["-i", state["display"]])
+    if args.seconds is not None:
+        cmd.extend(["-t", str(args.seconds)])
+    cmd.extend(["-an", "-c:v", "ffv1", "-threads", "1", "-f", "matroska", str(file)])
+    print(f"录制专用 X11 显示 {state['display']} → {file}", flush=True)
+    # exec keeps ffmpeg in the caller's foreground process group for Ctrl-C finalization.
+    os.execvpe(cmd[0], cmd, env)
+
+
+def main():
+    if sys.argv[1:] == ["--check-managed-display"]:
+        probe()
+        return 0
+    parser = argparse.ArgumentParser(description="X11 专用展示与录屏黑屏验证")
+    parser.add_argument("--native", action="store_true", help="从本机前台文字 VT 启动原生专用 Xorg")
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("demo", help="播放内置循环演示，按 Q 退出")
+    sub.add_parser("play", help="播放本地视频，按 Q 退出").add_argument("file")
+    sub.add_parser("run", help="在专用 DISPLAY 内运行指定 X11 程序").add_argument("command", nargs=argparse.REMAINDER)
+    sub.add_parser("info", help="显示运行中会话的连接参数")
+    rec = sub.add_parser("record", help="以 FFmpeg 验证专用 X11 显示的视频读取")
+    rec.add_argument("output", metavar="OUT.mkv")
+    rec.add_argument("--seconds", type=float, help="指定录制时长（秒）")
+    rec.add_argument("--window-id", type=lambda s: int(s, 0), help="只录指定 X11 窗口，支持 0x 十六进制")
+    args = parser.parse_args()
+    if args.action in ("info", "record"):
+        if args.native:
+            parser.error("--native 应用于 demo、play 或 run")
+        state = load_display(state_dir())
+        if args.action == "info":
+            connection_info(state)
+            return 0
+        return record(args, state)
+    signal.signal(signal.SIGTERM, stop)
+    return launch(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt, Interrupted):
+        sys.exit(130)
+    except (Error, OSError, sp.TimeoutExpired) as err:
+        print(f"x11-showcase: {err}", file=sys.stderr)
+        sys.exit(1)

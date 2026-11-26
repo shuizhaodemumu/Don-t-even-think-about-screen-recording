@@ -1,0 +1,285 @@
+--- a/dix/dispatch.c
++++ b/dix/dispatch.c
+@@ -2135,22 +2135,26 @@
+     return Success;
+ }
+ 
++/* This dedicated server has one readback policy for its whole lifetime.
++ * Do not build an alternate Xinerama readback dispatcher into this binary. */
++#ifdef PANORAMIX
++#error "Build the showcase server with -Dxinerama=false."
++#endif
++
+ static int
+ DoGetImage(ClientPtr client, int format, Drawable drawable,
+            int x, int y, int width, int height,
+            Mask planemask)
+ {
+     DrawablePtr pDraw, pBoundingDraw;
+-    int nlines, linesPerBuf, rc;
+-    int linesDone;
++    static const char black[16384];
++    int rc;
+ 
+     /* coordinates relative to the bounding drawable */
+     int relx, rely;
+     long widthBytesLine, length;
+     Mask plane = 0;
+-    char *pBuf;
+     xGetImageReply xgi;
+-    RegionPtr pVisibleRegion = NULL;
+ 
+     if ((format != XYPixmap) && (format != ZPixmap)) {
+         client->errorValue = format;
+@@ -2236,99 +2240,16 @@
+ 
+     }
+ 
+-    xgi.length = length;
+-
+-    xgi.length = bytes_to_int32(xgi.length);
+-    if (widthBytesLine == 0 || height == 0)
+-        linesPerBuf = 0;
+-    else if (widthBytesLine >= IMAGE_BUFSIZE)
+-        linesPerBuf = 1;
+-    else {
+-        linesPerBuf = IMAGE_BUFSIZE / widthBytesLine;
+-        if (linesPerBuf > height)
+-            linesPerBuf = height;
+-    }
+-    length = linesPerBuf * widthBytesLine;
+-    if (linesPerBuf < height) {
+-        /* we have to make sure intermediate buffers don't need padding */
+-        while ((linesPerBuf > 1) &&
+-               (length & ((1L << LOG2_BYTES_PER_SCANLINE_PAD) - 1))) {
+-            linesPerBuf--;
+-            length -= widthBytesLine;
+-        }
+-        while (length & ((1L << LOG2_BYTES_PER_SCANLINE_PAD) - 1)) {
+-            linesPerBuf++;
+-            length += widthBytesLine;
+-        }
+-    }
+-    if (!(pBuf = calloc(1, length)))
+-        return BadAlloc;
++    /* Keep the upstream validation, pixel format, reply length and visual.
++     * Clients receive black without reading any pixels from the drawable.
++     * Chunks are 4-byte aligned, including for planar and swapped clients. */
++    xgi.length = bytes_to_int32(length);
+     WriteReplyToClient(client, sizeof(xGetImageReply), &xgi);
+-
+-    if (pDraw->type == DRAWABLE_WINDOW) {
+-        pVisibleRegion = &((WindowPtr) pDraw)->borderClip;
+-        pDraw->pScreen->SourceValidate(pDraw, x, y, width, height,
+-                                       IncludeInferiors);
+-    }
+-
+-    if (linesPerBuf == 0) {
+-        /* nothing to do */
+-    }
+-    else if (format == ZPixmap) {
+-        linesDone = 0;
+-        while (height - linesDone > 0) {
+-            nlines = min(linesPerBuf, height - linesDone);
+-            (*pDraw->pScreen->GetImage) (pDraw,
+-                                         x,
+-                                         y + linesDone,
+-                                         width,
+-                                         nlines,
+-                                         format, planemask, (void *) pBuf);
+-            if (pVisibleRegion)
+-                XaceCensorImage(client, pVisibleRegion, widthBytesLine,
+-                                pDraw, x, y + linesDone, width,
+-                                nlines, format, pBuf);
+-
+-            /* Note that this is NOT a call to WriteSwappedDataToClient,
+-               as we do NOT byte swap */
+-            ReformatImage(pBuf, (int) (nlines * widthBytesLine),
+-                          BitsPerPixel(pDraw->depth), ClientOrder(client));
+-
+-            WriteToClient(client, (int) (nlines * widthBytesLine), pBuf);
+-            linesDone += nlines;
+-        }
+-    }
+-    else {                      /* XYPixmap */
+-
+-        for (; plane; plane >>= 1) {
+-            if (planemask & plane) {
+-                linesDone = 0;
+-                while (height - linesDone > 0) {
+-                    nlines = min(linesPerBuf, height - linesDone);
+-                    (*pDraw->pScreen->GetImage) (pDraw,
+-                                                 x,
+-                                                 y + linesDone,
+-                                                 width,
+-                                                 nlines,
+-                                                 format, plane, (void *) pBuf);
+-                    if (pVisibleRegion)
+-                        XaceCensorImage(client, pVisibleRegion,
+-                                        widthBytesLine,
+-                                        pDraw, x, y + linesDone, width,
+-                                        nlines, format, pBuf);
+-
+-                    /* Note: NOT a call to WriteSwappedDataToClient,
+-                       as we do NOT byte swap */
+-                    ReformatImage(pBuf, (int) (nlines * widthBytesLine),
+-                                  1, ClientOrder(client));
+-
+-                    WriteToClient(client, (int)(nlines * widthBytesLine), pBuf);
+-                    linesDone += nlines;
+-                }
+-            }
+-        }
+-    }
+-    free(pBuf);
++    while (length > 0) {
++        int count = min(length, (long) sizeof(black));
++        WriteToClient(client, count, black);
++        length -= count;
++    }
+     return Success;
+ }
+ 
+--- a/Xext/shm.c
++++ b/Xext/shm.c
+@@ -621,7 +621,6 @@
+     xShmGetImageReply xgi;
+     ShmDescPtr shmdesc;
+     VisualID visual = None;
+-    RegionPtr pVisibleRegion = NULL;
+     int rc;
+ 
+     REQUEST(xShmGetImageReq);
+@@ -653,11 +652,6 @@
+                wBorderWidth((WindowPtr) pDraw) + (int) pDraw->height)
+             return BadMatch;
+         visual = wVisual(((WindowPtr) pDraw));
+-        if (pDraw->type == DRAWABLE_WINDOW)
+-            pVisibleRegion = &((WindowPtr) pDraw)->borderClip;
+-        pDraw->pScreen->SourceValidate(pDraw, stuff->x, stuff->y,
+-                                       stuff->width, stuff->height,
+-                                       IncludeInferiors);
+     }
+     else {
+         if (stuff->x < 0 ||
+@@ -686,39 +680,10 @@
+     VERIFY_SHMSIZE(shmdesc, stuff->offset, length, client);
+     xgi.size = length;
+ 
+-    if (length == 0) {
+-        /* nothing to do */
+-    }
+-    else if (stuff->format == ZPixmap) {
+-        (*pDraw->pScreen->GetImage) (pDraw, stuff->x, stuff->y,
+-                                     stuff->width, stuff->height,
+-                                     stuff->format, stuff->planeMask,
+-                                     shmdesc->addr + stuff->offset);
+-        if (pVisibleRegion)
+-            XaceCensorImage(client, pVisibleRegion,
+-                    PixmapBytePad(stuff->width, pDraw->depth), pDraw,
+-                    stuff->x, stuff->y, stuff->width, stuff->height,
+-                    stuff->format, shmdesc->addr + stuff->offset);
+-    }
+-    else {
+-
+-        length = stuff->offset;
+-        for (; plane; plane >>= 1) {
+-            if (stuff->planeMask & plane) {
+-                (*pDraw->pScreen->GetImage) (pDraw,
+-                                             stuff->x, stuff->y,
+-                                             stuff->width, stuff->height,
+-                                             stuff->format, plane,
+-                                             shmdesc->addr + length);
+-                if (pVisibleRegion)
+-                    XaceCensorImage(client, pVisibleRegion,
+-                            BitmapBytePad(stuff->width), pDraw,
+-                            stuff->x, stuff->y, stuff->width, stuff->height,
+-                            stuff->format, shmdesc->addr + length);
+-                length += lenPer;
+-            }
+-        }
+-    }
++    /* SHM buffers are supplied by the caller and may already hold nonzero
++     * pixels. Clear exactly the validated reply range at the given offset. */
++    if (length)
++        memset(shmdesc->addr + stuff->offset, 0, length);
+ 
+     if (client->swapped) {
+         swaps(&xgi.sequenceNumber);
+@@ -1563,6 +1528,9 @@
+                 screenInfo.screens[i]->DestroyPixmap = ShmDestroyPixmap;
+             }
+     }
++    /* This session permits SHM image transfers, but does not export
++     * live drawable storage as client-writable shared pixmaps. */
++    sharedPixmaps = FALSE;
+     ShmSegType = CreateNewResourceType(ShmDetachSegment, "ShmSeg");
+     if (ShmSegType &&
+         (extEntry = AddExtension(SHMNAME, ShmNumberEvents, ShmNumberErrors,
+--- a/xfixes/cursor.c
++++ b/xfixes/cursor.c
+@@ -318,45 +318,9 @@
+     cpswapl(from->name, to->name);
+ }
+ 
+-static void
+-CopyCursorToImage(CursorPtr pCursor, CARD32 *image)
+-{
+-    int width = pCursor->bits->width;
+-    int height = pCursor->bits->height;
+-    int npixels = width * height;
+-
+-    if (pCursor->bits->argb)
+-        memcpy(image, pCursor->bits->argb, npixels * sizeof(CARD32));
+-    else
+-    {
+-        unsigned char *srcLine = pCursor->bits->source;
+-        unsigned char *mskLine = pCursor->bits->mask;
+-        int stride = BitmapBytePad(width);
+-        int x, y;
+-        CARD32 fg, bg;
+-
+-        fg = (0xff000000 |
+-              ((pCursor->foreRed & 0xff00) << 8) |
+-              (pCursor->foreGreen & 0xff00) | (pCursor->foreBlue >> 8));
+-        bg = (0xff000000 |
+-              ((pCursor->backRed & 0xff00) << 8) |
+-              (pCursor->backGreen & 0xff00) | (pCursor->backBlue >> 8));
+-        for (y = 0; y < height; y++) {
+-            for (x = 0; x < width; x++) {
+-                if (GetBit(mskLine, x)) {
+-                    if (GetBit(srcLine, x))
+-                        *image++ = fg;
+-                    else
+-                        *image++ = bg;
+-                }
+-                else
+-                    *image++ = 0;
+-            }
+-            srcLine += stride;
+-            mskLine += stride;
+-        }
+-    }
+-}
++/* XFixes clients can optionally composite a cursor on top of GetImage.
++ * Both cursor-image replies below are calloc'd: leave their ARGB transparent.
++ * The physical pointer is still displayed by the normal server sprite path. */
+ 
+ int
+ ProcXFixesGetCursorImage(ClientPtr client)
+@@ -396,7 +360,6 @@
+     rep->cursorSerial = pCursor->serialNumber;
+ 
+     image = (CARD32 *) (rep + 1);
+-    CopyCursorToImage(pCursor, image);
+     if (client->swapped) {
+         swaps(&rep->sequenceNumber);
+         swapl(&rep->length);
+@@ -550,7 +513,6 @@
+     rep->nbytes = nbytes;
+ 
+     image = (CARD32 *) (rep + 1);
+-    CopyCursorToImage(pCursor, image);
+     memcpy((image + npixels), name, nbytes);
+     if (client->swapped) {
+         swaps(&rep->sequenceNumber);
