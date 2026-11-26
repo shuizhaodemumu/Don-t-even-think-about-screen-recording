@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 4 || $# -gt 5 ]] || [[ $# == 5 && $5 != --gstreamer ]]; then
+    echo "Usage: run-native stock|guard XORG DUMMY_MODULE_OR_MODULES_DIR OUTPUT_DIR [--gstreamer]" >&2
+    exit 2
+fi
+mode=$1
+server=$(realpath -- "$(command -v -- "$2")")
+modules=$(realpath -- "$3")
+if [[ -f "$modules" && ${modules##*/} == dummy_drv.so ]]; then
+    modules=$(dirname -- "$(dirname -- "$modules")")
+fi
+if [[ ! -x "$server" || ! -r "$modules/drivers/dummy_drv.so" ]]; then
+    echo "Need an executable Xorg and a module directory containing drivers/dummy_drv.so." >&2
+    exit 2
+fi
+
+# Only the chosen output directory is exposed writable inside the namespace.
+mkdir -p -m 700 -- "$4"
+output=$(realpath -- "$4")
+tests=$(cd -- "$(dirname -- "$0")" && pwd -P)
+shift 4
+exec bwrap --die-with-parent --ro-bind / / --unshare-user --uid 0 --gid 0 \
+    --unshare-pid --unshare-ipc --unshare-net --unshare-uts \
+    --dev /dev --proc /proc --tmpfs /sys --tmpfs /run --tmpfs /tmp \
+    --ro-bind "$tests" /tmp/qa-tests --ro-bind "$server" /tmp/qa-server \
+    --ro-bind "$modules" /tmp/qa-modules --bind "$output" /tmp/qa-output \
+    --unsetenv DISPLAY --unsetenv WAYLAND_DISPLAY --unsetenv XAUTHORITY \
+    --unsetenv DBUS_SESSION_BUS_ADDRESS --setenv XDG_RUNTIME_DIR /tmp \
+    --setenv X11_QA_NAMESPACE 1 --setenv TMPDIR /tmp --chdir /tmp \
+    -- python3 /tmp/qa-tests/capture_test.py "$mode" /tmp/qa-server \
+    --native-modules /tmp/qa-modules --out /tmp/qa-output "$@"
